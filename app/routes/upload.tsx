@@ -1,95 +1,126 @@
-// Import React hooks and types we need
-import { useState, type FormEvent} from 'react'
-// Import custom components we built elsewhere
+import {type FormEvent, useState} from 'react'
+import Navbar from '~/componants/Navbar';
 import FileUploader from '~/componants/FileUploader';
-import Navbar from '~/componants/Navbar'
+import {usePuterStore} from "~/lib/puter";
+import {useNavigate} from "react-router";
+import {convertPdfToImage} from "~/lib/pdf2img";
+import {generateUUID} from "~/lib/utils";
+import { prepareInstructions } from '~/constants';
 
-// This is our main component for the upload page
-const upload = () => {
-    // useState lets us keep track of values that can change
-    const [isProcessing, setIsProcessing] = useState(false); // true/false if resume is being analyzed
-    const [statusText, setStatusText] = useState(''); // text message to show while processing
-    const [file, setFile] = useState<File | null >(null); // the uploaded file (or null if none yet)
+const Upload = () => {
+    const { auth, isLoading, fs, ai, kv } = usePuterStore();
+    const navigate = useNavigate();
+    const [isProcessing, setIsProcessing] = useState(false);
+    const [statusText, setStatusText] = useState('');
+    const [file, setFile] = useState<File | null>(null);
 
-    // This function runs when a file is selected in FileUploader
     const handleFileSelect = (file: File | null) => {
-        setFile(file) // save the file into our state
-    };
-
-    // This function runs when the form is submitted
-    const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
-        e.preventDefault(); // stop the page from refreshing
-        const form = e.currentTarget.closest('form'); // find the form element
-        if(!form) return; // if no form found, stop
-
-        // Collect all the form data (company name, job title, etc.)
-        const formData = new FormData(form);
-        const companyName = formData.get('company-name');
-        const jobTitle = formData.get('job-title');
-        const jobDescription = formData.get('job-description');
-
-        // For now, just log everything to the console
-        console.log({companyName, jobTitle, jobDescription, file});
+        setFile(file)
     }
 
-  // What the component shows on the screen
-  return (
-    <main className="bg-[url('/images/bg-main.svg')] bg-cover">
-      {/* Navbar at the top */}
-      <Navbar />
+    const handleAnalyze = async ({ companyName, jobTitle, jobDescription, file }: { companyName: string, jobTitle: string, jobDescription: string, file: File  }) => {
+        setIsProcessing(true);
 
-      <section className="main-section">
-        <div className='page-heading py-16'>
-            <h1>Smart feedback for your dreem job</h1>
+        setStatusText('Uploading the file...');
+        const uploadedFile = await fs.upload([file]);
+        if(!uploadedFile) return setStatusText('Error: Failed to upload file');
 
-            {/* If we are processing, show loading text + animation */}
-            {isProcessing ? (
-                <>
-                    <h2>{statusText}</h2>
-                    <img src="/images/resume-scan.gif" className='w-full' />
-                </>
-            ) : (
-                // Otherwise show instructions
-                <h2>Drop your resume for an ATS score and imporovement tips</h2>
-            )}
+        setStatusText('Converting to image...');
+        const imageFile = await convertPdfToImage(file);
+        if(!imageFile.file) return setStatusText('Error: Failed to convert PDF to image');
 
-            {/* Only show the form if we are NOT processing */}
-            {!isProcessing && (
-                <form id='upload-form' onSubmit={handleSubmit} className='flex flex-col gap-4 mt-8'>
+        setStatusText('Uploading the image...');
+        const uploadedImage = await fs.upload([imageFile.file]);
+        if(!uploadedImage) return setStatusText('Error: Failed to upload image');
 
-                    {/* Input for company name */}
-                    <div className='form-div'>
-                        <label htmlFor="company-name">Company Name</label>
-                        <input type="text" name='company-name' placeholder='Company Name' id='company-name'  />
-                    </div>
+        setStatusText('Preparing data...');
+        const uuid = generateUUID();
+        const data = {
+            id: uuid,
+            resumePath: uploadedFile.path,
+            imagePath: uploadedImage.path,
+            companyName, jobTitle, jobDescription,
+            feedback: '',
+        }
+        await kv.set(`resume:${uuid}`, JSON.stringify(data));
 
-                    {/* Input for job title */}
-                    <div className='form-div'>
-                        <label htmlFor="job-title">Job Title</label>
-                        <input type="text" name='job-title' placeholder='Job Title' id='job-title'  />
-                    </div>
+        setStatusText('Analyzing...');
 
-                    {/* Text area for job description */}
-                    <div className='form-div'>
-                        <label htmlFor="job-description">Job Title</label>
-                        <textarea rows={5} name='job-description' placeholder='Job Description' id='job-description'  />
-                    </div>
+        const feedback = await ai.feedback(
+            uploadedFile.path,
+            prepareInstructions({ jobTitle, jobDescription })
+        )
+        if (!feedback) return setStatusText('Error: Failed to analyze resume');
 
-                    {/* File uploader component for resume */}
-                    <div className='form-div'>
-                        <label htmlFor="uploader">Upload Resume</label>
-                        <FileUploader onFileSelect={handleFileSelect}/>
-                    </div>
+        const feedbackText = typeof feedback.message.content === 'string'
+            ? feedback.message.content
+            : feedback.message.content[0].text;
 
-                    {/* Submit button */}
-                    <button className='primary-button' type='submit'>Analyze Resume</button>
-                </form>
-            )}
-        </div>
-      </section>
-    </main>
-  )
+        data.feedback = JSON.parse(feedbackText);
+        await kv.set(`resume:${uuid}`, JSON.stringify(data));
+        setStatusText('Analysis complete, redirecting...');
+        console.log(data);
+        navigate(`/resume/${uuid}`);
+    }
+
+    const handleSubmit = (e: FormEvent<HTMLFormElement>) => {
+        e.preventDefault();
+        const form = e.currentTarget.closest('form');
+        if(!form) return;
+        const formData = new FormData(form);
+
+        const companyName = formData.get('company-name') as string;
+        const jobTitle = formData.get('job-title') as string;
+        const jobDescription = formData.get('job-description') as string;
+
+        if(!file) return;
+
+        handleAnalyze({ companyName, jobTitle, jobDescription, file });
+    }
+
+    return (
+        <main className="bg-[url('/images/bg-main.svg')] bg-cover">
+            <Navbar />
+
+            <section className="main-section">
+                <div className="page-heading py-16">
+                    <h1>Smart feedback for your dream job</h1>
+                    {isProcessing ? (
+                        <>
+                            <h2>{statusText}</h2>
+                            <img src="/images/resume-scan.gif" className="w-full" />
+                        </>
+                    ) : (
+                        <h2>Drop your resume for an ATS score and improvement tips</h2>
+                    )}
+                    {!isProcessing && (
+                        <form id="upload-form" onSubmit={handleSubmit} className="flex flex-col gap-4 mt-8">
+                            <div className="form-div">
+                                <label htmlFor="company-name">Company Name</label>
+                                <input type="text" name="company-name" placeholder="Company Name" id="company-name" />
+                            </div>
+                            <div className="form-div">
+                                <label htmlFor="job-title">Job Title</label>
+                                <input type="text" name="job-title" placeholder="Job Title" id="job-title" />
+                            </div>
+                            <div className="form-div">
+                                <label htmlFor="job-description">Job Description</label>
+                                <textarea rows={5} name="job-description" placeholder="Job Description" id="job-description" />
+                            </div>
+
+                            <div className="form-div">
+                                <label htmlFor="uploader">Upload Resume</label>
+                                <FileUploader onFileSelect={handleFileSelect} />
+                            </div>
+
+                            <button className="primary-button" type="submit">
+                                Analyze Resume
+                            </button>
+                        </form>
+                    )}
+                </div>
+            </section>
+        </main>
+    )
 }
-
-// Export this component so it can be used in other parts of the app
-export default upload
+export default Upload
